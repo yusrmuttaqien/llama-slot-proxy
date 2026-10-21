@@ -1,0 +1,27 @@
+# Spec trace
+
+Each spec section maps to the tests that prove it. `tests/test_audit.py` fails if a listed test
+does not exist, or if a feature module has no call site in the pipeline / startup / shutdown code.
+
+| Spec section | Tests |
+|---|---|
+| 1.1 / 1.5 lazy startup, no independent upstream hits | test_no_upstream_calls_until_first_request, test_startup_routine_runs_before_serving |
+| 3.1 chat id, entry id | test_first_recognized_header_wins, test_entry_id_is_md5_of_chat_underscore_model |
+| 3.2 delta from timings | test_delta_sse_split_at_every_byte_boundary, test_delta_non_stream_json_and_missing_timings, test_delta_trigger_uses_timings |
+| 3.3 slot-save-path fetch | test_first_request_fetches_models_before_forwarding_then_never_again, test_failed_fetch_stores_none_and_client_still_served |
+| 3.4 setup validation | test_validate_each_check, test_validate_clean_setup_has_no_warnings, test_setup_warnings_are_printed_without_blocking |
+| 4.1 runtime state | test_state_set_active_and_reset |
+| 4.2 ledger | test_ledger_roundtrip_and_dates, test_ledger_write_is_atomic, test_ledger_missing_or_corrupt_recreated_empty |
+| 5 request lifecycle, classification | test_classification_table, test_verbose_log_shows_classification, test_get_and_post_forwarded_unchanged, test_sse_arrives_incrementally_and_is_byte_identical |
+| 6.1 lazy restore | test_known_entry_is_restored_before_the_chat_call, test_already_loaded_entry_is_not_restored_again, test_new_chat_no_restore_added_to_loaded_then_saved, test_noop_never_restores_and_clears_active_chat, test_restore_rejected_drops_entry_still_serves_chat_and_resaves, test_restore_rejected_deletes_the_old_entry_and_bin, test_restore_timeout_keeps_entry_and_serves_chat |
+| 6.2 model change | test_model_change_saves_old_model_before_forwarding, test_model_change_without_active_chat_does_not_save, test_noop_with_model_id_still_triggers_model_change |
+| 6.3.1 save triggers | test_time_trigger_respects_threshold, test_delta_trigger_uses_timings, test_noop_and_failed_responses_never_save, test_save_runs_after_the_chat_and_before_the_next_queued_request |
+| 6.3.2 save procedure | test_slot_save_path_change_moves_the_bin, test_failing_save_does_not_affect_client_response, test_save_timeout_logs_and_queue_continues |
+| 6.4 unload | test_unload_of_active_model_saves_first_then_resets, test_unload_of_other_model_has_no_save_and_keeps_state |
+| 6.5 shutdown | test_graceful_shutdown_waits_for_inflight_rejects_waiters_and_saves, test_shutdown_with_no_active_chat_does_not_save, test_sigterm_when_idle_saves_active_chat_and_exits_cleanly, test_sigterm_during_a_stream_lets_it_finish_then_saves, test_second_signal_forces_immediate_exit |
+| 7.1 startup routine | test_startup_routine_cases, test_startup_routine_runs_before_serving |
+| 7.2 disk limit | test_evict_noop_under_limit_and_target_when_over, test_evict_order_uses_latest_activity_null_dates_oldest_and_protects_active, test_eviction_runs_before_a_save |
+| 8 queue | test_queue_is_fifo_and_single_flight, test_queue_limit_counts_waiting_only, test_queue_timeout_covers_waiting_only, test_queue_zero_means_unlimited, test_chats_reach_upstream_one_at_a_time, test_bypass_requests_do_not_wait_behind_a_slow_chat, test_sse_events_endpoint_never_blocks_the_queue, test_client_that_leaves_while_waiting_never_reaches_upstream, test_client_disconnect_mid_stream_aborts_upstream_and_frees_queue, test_non_stream_disconnect_aborts_upstream |
+| 9 errors and status codes | test_queue_limit_gives_429, test_queue_timeout_gives_504_and_waiting_request_never_reaches_upstream, test_upstream_down_gives_502_with_message, test_graceful_shutdown_waits_for_inflight_rejects_waiters_and_saves, test_unexpected_pipeline_error_gives_500_and_releases_queue, test_connection_error_during_slot_call_resets_state, test_upstream_http_errors_pass_through_unchanged |
+| 10 config and flags | test_config_missing_file_is_created_with_defaults, test_config_docs_mirror_every_key, test_config_corrupt_file_recreated, test_config_invalid_values_rejected, test_generate_config_flag_writes_and_refuses_overwrite, test_generate_config_flag_runs_as_a_script |
+| end to end | test_restart_restores_a_saved_chat_before_its_chat_call, test_a_b_a_in_one_run_does_not_restore_the_second_a, test_model_switch_then_unload_then_back, test_upstream_down_then_up_recovers |
