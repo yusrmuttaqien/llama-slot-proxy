@@ -175,7 +175,7 @@ All steps run inside the queue, in this order:
 
 1. **Eviction check** (7.2): if total saved bin size is above the limit, evict first.
 2. **Resolve the path.** If the model's tracked path is `None`, retry the fetch (3.3). If it is still `None`, use the existing ledger path if the entry has one; with neither, skip the save and log an error.
-3. **Path comparison.** If the directory of the ledger entry's `bin_path` differs from the tracked path (and the tracked path is not `None`): delete the old bin, save to the new path, and update `bin_path` in the ledger.
+3. **Path comparison.** If the directory of the ledger entry's `bin_path` differs from the tracked path (and the tracked path is not `None`): save to the new path, and only after that save succeeds delete the old bin, then update `bin_path` in the ledger.
 4. **Save** with `filename` = `<entry id>.bin` (12.2), bounded by `save_timeout`.
 5. **Update the ledger** (create the entry if new; set `dates.saved`; write atomically).
 
@@ -213,7 +213,7 @@ Runs once at startup (queue blocking, so no request can restore a missing bin):
 
 Runs inside the queue, only when a save trigger fires, before the save:
 
-1. Compute total bin size (GB) from the files in the ledger.
+1. Compute total bin size (GiB, 1024^3 bytes) from the files in the ledger.
 2. If it is above `bin_max_total_gb`, delete entries (and their bins) until total size is at or below `bin_max_total_gb * (1 - bin_padding_percent / 100)`. **\[new\]**
 3. Eviction order, oldest first, is a sort key made of the entry's most recent activity, then tie-breakers:
    1. `max(restored, saved)` (treat a null date as the oldest possible date),
@@ -278,7 +278,7 @@ On a connection error: return `502` for the client request and reset active chat
 | `save_time_threshold` | float (s) | Time trigger (6.3.1). |
 | `delta_context_threshold` | int (tokens) | Delta trigger (6.3.1). |
 | `save_timeout` | float (s) | Bound for save and restore calls. |
-| `bin_max_total_gb` | float (GB) | Disk limit (7.2). |
+| `bin_max_total_gb` | float (GiB, 1024^3 bytes) | Disk limit (7.2). |
 | `bin_padding_percent` | float (%) | Eviction target is `max * (1 - pct/100)`. |
 | `queue_timeout` | float (s, 0 = indefinite) | Queue wait only. |
 | `queue_limit` | int (0 = unlimited) | Waiting requests only. |

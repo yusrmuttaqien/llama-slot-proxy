@@ -39,10 +39,3 @@ the calls it records. `tests/test_audit.py` fails if a feature module is not wir
 `main.py` entry point; `src/pipeline.py` is the single request pipeline that calls every feature
 module (`classify`, `reqqueue`, `restore`, `save`, `evict`, `delta`, `slotpath`, `validate`,
 `startup`, `shutdown`, `ledger`, `state`, `upstream`, `config`, `log`).
-
-## Notes on choices the spec left open
-
-- Status codes: 429 queue full, 504 queue wait timeout, 502 upstream unreachable, 503 shutting down, 500 internal error.
-- A chat with no ledger entry counts as never saved, so its first completed response is saved.
-- When a save moves a bin to a new slot-save-path, the old bin is deleted after the new save succeeds.
-- `bin_max_total_gb` is GiB (1024^3 bytes).
