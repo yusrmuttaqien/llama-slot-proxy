@@ -11,10 +11,19 @@ class Outcome(Enum):
 
 
 async def maybe_restore(ctx, c):
-    """For a TRACKED request: restore the slot from the ledger when appropriate."""
+    """For a TRACKED request: restore the slot from the ledger when appropriate.
+
+    A continuation (the same conversation as the previous request) is already in the
+    active slot, so it is never restored. A switch to a different conversation that has
+    a saved state is always restored, even if that conversation was seen before: the
+    upstream engine may have evicted it in the meantime, and the on-disk snapshot is
+    then the only remaining copy. (Spec 6.1, amended for NInfer's dynamic retention —
+    the engine, not the proxy, decides what stays resident, so a proxy-side "seen"
+    set cannot be trusted to mean "still in the slot".)
+    """
     st, log = ctx.state, ctx.log
-    if c.entry_id in st.loaded_chats:
-        return Outcome.CONTINUE
+    if c.entry_id == st.active_chat:
+        return Outcome.CONTINUE              # continuation: already in the active slot
     entry = ctx.ledger.get(c.entry_id)
     if entry is None:
         st.loaded_chats.add(c.entry_id)       # new unique request: degrade to prefill

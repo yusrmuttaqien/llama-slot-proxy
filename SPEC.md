@@ -85,7 +85,7 @@ Checks 3 to 5 depend on what `status.args` actually contains on your build (expl
 
 1. **Active model**: string. Set from every chat completion request that carries a model id.
 2. **Active chat**: string, the entry id currently believed to be in the slot. Set from every chat completion request. Set to `""` for a noop request.
-3. **Loaded chats**: set of entry ids already seen (or restored) since proxy start or last reset. It means seen or restored, not currently in the slot. Updated by 6.1 and cleared by resets (6.2, 6.4, 9.3).
+3. **Loaded chats**: set of entry ids already seen (or restored) since proxy start or last reset. It means seen or restored, not currently in the slot. Updated by 6.1 and cleared by resets (6.2, 6.4, 9.3). It is kept for observability and for the ledger eviction logic (7.2); the restore decision itself is driven by the *active chat* (6.1), not by this set.
 4. **Tracked slot-save-path**: map `{model_id: path}`, populated by 3.3 (with the config fallback of 3.3.3).
 5. The old `slot active` boolean is removed. The queue already guarantees one request at a time and nothing reads it. **\[new\]**
 
@@ -135,10 +135,12 @@ Noop and plain-forwarded requests skip steps 5 to 6 except where a trigger appli
 
 For a tracked request:
 
-1. Entry id is in the ledger **and** not in loaded chats: restore the slot, then forward.
-2. Entry id is not in the ledger **and** not in loaded chats: add it to loaded chats (a **new unique request**) and forward with no restore (plain prefill).
-3. Entry id already in loaded chats: forward with no restore.
+1. Entry id **is** the active chat (a **continuation** — same conversation as the previous request): forward with no restore. The conversation is already in the active slot, so restoring would be a pointless disk round-trip.
+2. Entry id is **not** in the ledger: add it to loaded chats (a **new unique request**) and forward with no restore (plain prefill).
+3. Otherwise (entry id is in the ledger, and it is a *different* conversation than the active chat): restore the slot, then forward. This happens even if the conversation was seen before, because the upstream engine may have evicted it in the meantime and the on-disk snapshot is then the only remaining copy.
 4. Noop request: forward with no restore.
+
+> **Note (NInfer / dynamic retention).** The original rule ("skip restore if the entry is in loaded chats") assumed the proxy controls slot residency, as in llama.cpp. In NInfer the *engine* decides what stays resident (active slot + a fixed pool of host state slots), so a proxy-side "seen" set cannot be trusted to mean "still in the slot". The rule above therefore restores on every switch to a different saved conversation. A redundant restore (switching back to a conversation that is still resident) costs only a small disk read plus a device round-trip, which is far cheaper than the full prefill that a missed restore would trigger.
 
 Restore procedure: call the restore endpoint (12.2) with `filename` set to the file name of the ledger entry's `bin_path`, bounded by `save_timeout`. The proxy cannot inspect the bin; it judges by the HTTP result:
 

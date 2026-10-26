@@ -32,9 +32,20 @@ async def test_restart_restores_a_saved_chat_before_its_chat_call(proxy_factory,
     assert s[1:3] == [f"slot:restore:27B:{eid()}.bin", "chat:27B"]
 
 
-async def test_a_b_a_in_one_run_does_not_restore_the_second_a(proxy, fake):
+async def test_a_b_a_restores_the_second_a(proxy, fake):
+    """Switching back to a previously-seen conversation restores it: the upstream engine
+    may have evicted it in the meantime, so the on-disk snapshot is the only copy left."""
     await proxy.chat(chat_id="A")
     await proxy.chat(chat_id="B")
+    await proxy.chat(chat_id="A")
+    assert f"slot:restore:27B:{eid('A')}.bin" in fake.summary()
+    assert proxy.ctx.state.active_chat == eid("A")
+
+
+async def test_continuation_is_not_restored(proxy, fake):
+    """The same conversation in a row is a continuation: it is already in the active slot,
+    so no restore (avoids a pointless disk round-trip)."""
+    await proxy.chat(chat_id="A")
     await proxy.chat(chat_id="A")
     assert not any(s.startswith("slot:restore") for s in fake.summary())
     assert proxy.ctx.state.active_chat == eid("A")
