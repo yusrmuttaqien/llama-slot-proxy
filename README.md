@@ -2,7 +2,9 @@
 
 A slim proxy in front of `llama-server` (router mode, one loaded model, `--parallel 1`) that
 lazily saves and restores the KV-cache slot per chat, so switching chats or restarting does not
-force a full prompt prefill. See the spec for behavior; `SPEC_TRACE.md` maps spec sections to tests.
+force a full prompt prefill. It works with any upstream that exposes the same
+`POST /slots/{id}?action=save|restore` and `POST /v1/chat/completions` endpoints — llama-server,
+and NInfer. See the spec for behavior; `SPEC_TRACE.md` maps spec sections to tests.
 
 ## Limitations and trade-offs
 
@@ -12,6 +14,7 @@ Everything below is a constraint you must accept to use the proxy. The proxy onl
 - Router mode, one model loaded at a time (`--models-max 1`; verify the flag name on your build)
 - Single slot: `--parallel 1` (or `-np 1`) — the proxy hard-codes slot `0`
 - `--slot-save-path` set and readable/writable by the proxy host; the proxy and llama-server share that filesystem
+- If the upstream does not expose `--slot-save-path` in `/v1/models` `status.args` (e.g. NInfer), set `slot_save_path` in `config.json` instead — the directory the upstream writes slot saves into, still shared with the proxy host
 - `--sleep-idle-seconds` unset or 0 — sleep discards the KV cache behind the proxy's back
 
 **How the proxy works (by design):**

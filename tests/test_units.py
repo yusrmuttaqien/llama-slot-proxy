@@ -17,7 +17,7 @@ from src.reqqueue import QueueClosed, QueueFull, QueueTimeout, RequestQueue
 from src.slotpath import get_arg
 from src.startup import run_startup_checks
 from src.state import State
-from src.validate import check
+from src.validate import check, check6
 
 
 class _Log:
@@ -60,6 +60,24 @@ def test_config_custom_values_and_partial_file(tmp_path):
 def test_config_invalid_values_rejected(tmp_path, bad):
     p = tmp_path / "c.json"
     p.write_text(json.dumps(bad))
+    with pytest.raises(cfgmod.ConfigError):
+        cfgmod.load_config(str(p))
+
+
+def test_config_slot_save_path_default_is_empty():
+    assert cfgmod.DEFAULTS["slot_save_path"] == ""
+
+
+@pytest.mark.parametrize("val", ["", "/tmp/ninfer-slots"])
+def test_config_slot_save_path_accepts_empty_and_paths(tmp_path, val):
+    p = tmp_path / "c.json"
+    p.write_text(json.dumps({"slot_save_path": val}))
+    assert cfgmod.load_config(str(p))["slot_save_path"] == val
+
+
+def test_config_slot_save_path_non_string_rejected(tmp_path):
+    p = tmp_path / "c.json"
+    p.write_text(json.dumps({"slot_save_path": 42}))
     with pytest.raises(cfgmod.ConfigError):
         cfgmod.load_config(str(p))
 
@@ -370,3 +388,15 @@ def test_validate_each_check(tmp_path):
 
 def test_validate_skips_models_without_args():
     assert check({"data": [{"id": "x", "status": {"value": "unloaded"}}]}) == []
+
+
+def test_validate_check6_upstream_without_status_and_no_config_warns(tmp_path):
+    data = {"data": [{"id": "ninfer-model", "object": "model"}]}   # no status object (NInfer)
+    assert any("check 6" in w for w in check6(data))
+    with_cfg = check6(data, {"slot_save_path": str(tmp_path)})
+    assert not any("check 6" in w for w in with_cfg)
+
+
+def test_validate_check6_not_triggered_for_llama_server(tmp_path):
+    args = ["--slot-save-path", str(tmp_path), "-np", "1"]
+    assert check6({"data": [_model(args)]}, {}) == []

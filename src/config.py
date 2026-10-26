@@ -16,6 +16,7 @@ DEFAULTS = {
     "bin_padding_percent": 10.0,
     "queue_timeout": 0.0,
     "queue_limit": 0,
+    "slot_save_path": "",
 }
 
 DOCS = {
@@ -29,6 +30,7 @@ DOCS = {
     "bin_padding_percent": "float (percent, 0-100). Eviction continues until total size is below bin_max_total_gb * (1 - percent/100).",
     "queue_timeout": "float (seconds, 0 = indefinite). Max time a request may wait in the proxy queue (not counting execution).",
     "queue_limit": "int (requests, 0 = unlimited). Max requests waiting in the queue; the in-flight request is not counted.",
+    "slot_save_path": "string (path). Optional. The upstream's slot-save directory to use when the upstream does not expose --slot-save-path in the /v1/models status.args (e.g. NInfer). A discovered path always wins over the configured one; a conflict is warned. Empty means discovery only. The directory must be readable and writable by the proxy host (shared filesystem).",
 }
 
 _INT_KEYS = {"listen_port", "delta_context_threshold", "queue_limit"}
@@ -36,7 +38,7 @@ _FLOAT_KEYS = {
     "save_time_threshold", "save_timeout", "bin_max_total_gb",
     "bin_padding_percent", "queue_timeout",
 }
-_STR_KEYS = {"upstream_url", "listen_host"}
+_STR_KEYS = {"upstream_url", "listen_host", "slot_save_path"}
 
 
 class ConfigError(Exception):
@@ -72,8 +74,10 @@ def _validate(raw):
         if key == "$docs" or key not in DEFAULTS:
             continue
         if key in _STR_KEYS:
-            if not isinstance(value, str) or not value:
-                raise ConfigError(f"config '{key}' must be a non-empty string")
+            if not isinstance(value, str):
+                raise ConfigError(f"config '{key}' must be a string")
+            if value == "" and key != "slot_save_path":
+                raise ConfigError(f"config '{key}' must be non-empty")
         elif key in _INT_KEYS:
             if isinstance(value, bool) or not isinstance(value, int):
                 raise ConfigError(f"config '{key}' must be an integer")

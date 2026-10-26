@@ -44,7 +44,8 @@ async def _save(ctx, entry_id, chat_id, model_id, reason):
     elif entry is not None:
         target_dir = os.path.dirname(entry["bin_path"])
     else:
-        log.error(f"save of entry {entry_id} skipped: slot-save-path of model {model_id} is unknown")
+        log.error(f"save of entry {entry_id} skipped: slot-save-path of model {model_id} is unknown "
+                  "(the upstream exposes no --slot-save-path and config slot_save_path is unset)")
         return False
 
     # 3. path comparison (ledger path vs tracked path)

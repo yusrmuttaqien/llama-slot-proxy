@@ -47,6 +47,28 @@ def check(models_response):
     return warnings
 
 
+# Check 6: an upstream that exposes no status.args at all (not llama-server in router mode,
+# e.g. NInfer) can only be handled through config slot_save_path.
+
+def check6(models_response, config=None):
+    """Return warning strings for check 6 (upstream without status.args, no config path)."""
+    models = models_response.get("data") if isinstance(models_response, dict) else None
+    if not isinstance(models, list) or not models:
+        return []
+    entries = [m for m in models if isinstance(m, dict)]
+    if any(isinstance(m.get("status"), dict) for m in entries):
+        return []
+    has_config = isinstance(config, dict) and bool(config.get("slot_save_path"))
+    if has_config:
+        return []
+    return ["setup check 6: /v1/models exposes no status object (the upstream is not a llama-server "
+            "in router mode, e.g. NInfer) and config slot_save_path is unset; saves for tracked "
+            "chats will be skipped. Set slot_save_path in config.json to the directory the upstream "
+            "writes slot saves into."]
+
+
 def run(ctx, models_response):
     for w in check(models_response):
+        ctx.log.warn(w)
+    for w in check6(models_response, ctx.config):
         ctx.log.warn(w)

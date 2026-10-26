@@ -9,10 +9,10 @@
    4. Implementation stays minimal: only what these roles need.
    5. The proxy never hits the server on its own at startup. Any first fetch it needs waits for the first incoming request, then runs before that request (inside the queue).
 2. Supported setup (everything else is out of scope; the proxy only warns about violations, see 3.4):
-   1. llama-server in **router mode**, with **at most one model loaded at a time** **\[new\]** (router flag `--models-max 1`; verify the exact flag name on your build).
+   1. llama-server in **router mode**, with **at most one model loaded at a time** **\[new\]** (router flag `--models-max 1`; verify the exact flag name on your build). Non-llama-server upstreams (e.g. NInfer) are supported insofar as they expose the same `POST /slots/{id}?action=save|restore` and `POST /v1/chat/completions` endpoints; their `GET /v1/models` does not expose `status.args`, so the slot-save path comes from config `slot_save_path` (3.3.3) and setup checks 2-5 do not apply to them.
    2. Single slot (`--parallel 1`). The proxy always addresses slot `0` in code, not user configurable.
    3. Only `POST /v1/chat/completions` is processed by the proxy **\[new\]**. Every other endpoint is plain-forwarded (see 5.1).
-   4. Proxy and llama-server **share the same filesystem path** **\[new\]**. llama-server writes bins under each model's own `--slot-save-path`; the proxy discovers that path from llama-server (3.3) and reads, lists and deletes bins there.
+   4. Proxy and llama-server **share the same filesystem path** **\[new\]**. llama-server writes bins under each model's own `--slot-save-path`; the proxy discovers that path from llama-server (3.3) and reads, lists and deletes bins there. For upstreams without `--slot-save-path` (1.2.1), the shared directory is the one set in config `slot_save_path`.
    5. llama-server must **not** run with `--sleep-idle-seconds` set above 0 (leave it unset or 0, disabled): sleep discards the KV cache without the proxy noticing, so loaded chats (4.1) would go stale and restore would be skipped. **\[new\]**
 3. Accepted trade-offs (intentional, listed so they are not mistaken for bugs):
    1. No LRU or message-hash validation. Restore is dumb and degrades naturally when the bin is shorter than, or no longer matches, the request's messages. The next lazy save re-syncs it.
@@ -57,6 +57,7 @@ The proxy collects what it needs from these sources and nothing else. Config (se
 
 1. **Slot save path per model.** In router mode, call `GET /v1/models` and read the `--slot-save-path` value from each model's `status.args`.
 2. Fetched once, as the first internal call (before the first forwarded client request, after the startup routine in 7.1), going through the queue. If it fails or the value is missing (for example the model is unloaded and `args` is absent), the tracked value is `None` and the fetch is retried before the next save.
+3. **Config fallback** **\[new\]**: when the fetched `status.args` does not contain `--slot-save-path` (for example the upstream is not llama-server in router mode, such as NInfer), the tracked value falls back to `slot_save_path` from config.json (default empty, no fallback). A discovered value always wins over a configured one; a conflict is warned. A model still `None` after both (no discovery, no config) is handled as no path: saves for it are skipped (6.3.2 step 2) and check 6 (3.4) warns.
 
 ### 3.4 Setup validation **\[new\]**
 
@@ -74,6 +75,7 @@ The proxy checks the supported setup (1.2) with warn-only checks that read the s
 | 3 | Single slot | `--parallel` or `-np` in `status.args` | Missing, or the value is not `1`. Missing also warns because the server default is not guaranteed to be 1. |
 | 4 | Sleep disabled | `--sleep-idle-seconds` in `status.args` | Present with a value above `0`. Absent is fine. |
 | 5 | Shared path | `--slot-save-path` in `status.args`, plus a local check | The flag is missing (save and restore would return `501`), or the directory does not exist or is not writable by the proxy (`os.path.isdir` and `os.access` with write permission). |
+| 6 | Discoverable path, or config | `status.args` across all entries, plus config `slot_save_path` | No entry exposes a `status` object at all (not llama-server in router mode, e.g. NInfer) and `slot_save_path` is empty; saves for tracked chats would be skipped. |
 
 Checks 3 to 5 depend on what `status.args` actually contains on your build (explicitly passed flags only, or also defaults). Verify against a real response before trusting a missing flag.
 
@@ -84,7 +86,7 @@ Checks 3 to 5 depend on what `status.args` actually contains on your build (expl
 1. **Active model**: string. Set from every chat completion request that carries a model id.
 2. **Active chat**: string, the entry id currently believed to be in the slot. Set from every chat completion request. Set to `""` for a noop request.
 3. **Loaded chats**: set of entry ids already seen (or restored) since proxy start or last reset. It means seen or restored, not currently in the slot. Updated by 6.1 and cleared by resets (6.2, 6.4, 9.3).
-4. **Tracked slot-save-path**: map `{model_id: path}`, populated by 3.3.
+4. **Tracked slot-save-path**: map `{model_id: path}`, populated by 3.3 (with the config fallback of 3.3.3).
 5. The old `slot active` boolean is removed. The queue already guarantees one request at a time and nothing reads it. **\[new\]**
 
 ### 4.2 Ledger (persistent, `ledger.json`)

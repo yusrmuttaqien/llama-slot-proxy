@@ -414,3 +414,65 @@ async def test_shutdown_with_no_active_chat_does_not_save(proxy, fake):
     fake.calls.clear()
     await graceful_shutdown(proxy.ctx)
     assert fake.summary() == []
+
+
+# --------------------------- upstream without status.args (NInfer style) ---
+
+NINFER_MODELS = {"object": "list", "data": [
+    {"id": "27B", "object": "model", "created": 0, "owned_by": "ninfer",
+     "max_model_len": 102400, "context_window": 102400, "modalities": {"vision": False}}]}
+
+
+async def test_ninfer_style_upstream_uses_config_slot_save_path(proxy_factory, fake):
+    p = await proxy_factory(slot_save_path=fake.slot_dir)
+    fake.models_override = NINFER_MODELS
+    r = await p.chat(chat_id="chatA")
+    assert r.status == 200
+    assert p.ctx.state.tracked_paths["27B"] == fake.slot_dir
+    assert f"slot:save:27B:{eid()}.bin" in fake.summary()
+    assert p.ctx.ledger.get(eid())["bin_path"] == fake.bin_path(eid())
+    assert "setup check 1" in p.err_text and "setup check 6" not in p.err_text
+
+
+async def test_ninfer_style_upstream_without_config_skips_saves_and_warns(proxy_factory, fake):
+    p = await proxy_factory()
+    fake.models_override = NINFER_MODELS
+    r = await p.chat(chat_id="chatA")
+    assert r.status == 200
+    assert p.ctx.state.tracked_paths["27B"] is None
+    assert not any(s.startswith("slot:save") for s in fake.summary())
+    assert "setup check 6" in p.err_text
+
+
+async def test_discovered_path_wins_over_conflicting_config(proxy_factory, fake):
+    p = await proxy_factory(slot_save_path=fake.slot_dir + "-conflict")
+    r = await p.chat(chat_id="chatA")   # fake exposes its own --slot-save-path
+    assert r.status == 200
+    assert p.ctx.state.tracked_paths["27B"] == fake.slot_dir
+    assert "differs from discovered" in p.err_text
+    assert p.ctx.ledger.get(eid())["bin_path"] == fake.bin_path(eid())
+
+
+async def test_models_fetch_failure_with_config_still_saves(proxy_factory, fake):
+    p = await proxy_factory(slot_save_path=fake.slot_dir)
+    fake.models_fail = True
+    r = await p.chat(chat_id="chatA")
+    assert r.status == 200
+    assert "could not fetch" in p.err_text
+    assert p.ctx.state.tracked_paths["27B"] == fake.slot_dir
+    assert f"slot:save:27B:{eid()}.bin" in fake.summary()
+
+
+async def test_ninfer_style_restart_restores_from_disk(proxy_factory, fake, tmp_path):
+    ledger_path = str(tmp_path / "ledger.json")
+    p1 = await proxy_factory(ledger_path=ledger_path, slot_save_path=fake.slot_dir)
+    fake.models_override = NINFER_MODELS
+    await p1.chat(chat_id="chatA")
+    assert os.path.exists(fake.bin_path(eid()))
+    await p1.stop()
+    fake.calls.clear()
+
+    p2 = await proxy_factory(ledger_path=ledger_path, slot_save_path=fake.slot_dir)
+    fake.models_override = NINFER_MODELS
+    await p2.chat(chat_id="chatA")
+    assert fake.summary()[0:2] == ["models", f"slot:restore:27B:{eid()}.bin"]
