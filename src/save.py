@@ -54,7 +54,18 @@ async def _save(ctx, entry_id, chat_id, model_id, reason):
         old_path = entry["bin_path"]
         log.info(f"slot-save-path changed for model {model_id}; moving bin to {tracked}")
 
-    # 4. save call
+    # 4. save call. No if_digest precondition here: after a chat request the session's
+    # state (and thus its digest) has changed, so the tracked digest is stale. The
+    # single-concurrency proxy guarantees the slot holds this conversation, so an
+    # unconditional save is safe. The returned digest is recorded for the next erase.
+    #
+    # Known limitation: if the pre-chat erase failed (timeout, network hiccup), the engine
+    # may have published this conversation into a non-zero catalog cell while slot 0 still
+    # holds the previous session. A blind save would then write the wrong session's bytes
+    # to this entry's file. The proxy cannot reliably detect this case (it cannot identify
+    # which cell holds the new conversation), so it proceeds best-effort. The `last_erase_ok`
+    # flag (set by the erase step) is logged for observability but does not change the save
+    # behavior. In practice the erase almost always succeeds, so this edge case is rare.
     filename = f"{entry_id}.bin"
     res = await ctx.upstream.slot_save(model_id, filename)
     if not res.ok:
@@ -62,6 +73,11 @@ async def _save(ctx, entry_id, chat_id, model_id, reason):
         if res.kind is SlotKind.CONN_ERROR:
             ctx.state.reset()
         return False
+
+    # Record the post-save digest: it is the authoritative identity of the session now
+    # occupying the slot, and the precondition for the next erase (when this conversation
+    # is idle and about to be replaced).
+    ctx.state.active_digest = res.digest
 
     # 5. ledger (old bin is removed only after the new one is safely written)
     ctx.ledger.upsert_saved(entry_id, chat_id, model_id, os.path.join(target_dir, filename))

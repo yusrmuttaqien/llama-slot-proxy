@@ -136,11 +136,25 @@ Noop and plain-forwarded requests skip steps 5 to 6 except where a trigger appli
 For a tracked request:
 
 1. Entry id **is** the active chat (a **continuation** — same conversation as the previous request): forward with no restore. The conversation is already in the active slot, so restoring would be a pointless disk round-trip.
-2. Entry id is **not** in the ledger: add it to loaded chats (a **new unique request**) and forward with no restore (plain prefill).
+2. Entry id is **not** in the ledger (a **new unique request**): add it to loaded chats. If a previous conversation occupies the slot, **erase** it first (6.1.1) so the engine publishes the new conversation into slot 0; then forward with no restore (plain prefill). For the very first request (no active chat) the slot is already vacant, so no erase is needed.
 3. Otherwise (entry id is in the ledger, and it is a *different* conversation than the active chat): restore the slot, then forward. This happens even if the conversation was seen before, because the upstream engine may have evicted it in the meantime and the on-disk snapshot is then the only remaining copy.
 4. Noop request: forward with no restore.
 
 > **Note (NInfer / dynamic retention).** The original rule ("skip restore if the entry is in loaded chats") assumed the proxy controls slot residency, as in llama.cpp. In NInfer the *engine* decides what stays resident (active slot + a fixed pool of host state slots), so a proxy-side "seen" set cannot be trusted to mean "still in the slot". The rule above therefore restores on every switch to a different saved conversation. A redundant restore (switching back to a conversation that is still resident) costs only a small disk read plus a device round-trip, which is far cheaper than the full prefill that a missed restore would trigger.
+
+#### 6.1.1 Vacating the slot for a new conversation
+
+NInfer's `/slots/{id}` addresses the private continuation-catalog cells, not a fixed active lane. A *new* conversation is published by the engine to the first *vacant* catalog cell. If slot 0 still holds the previous conversation, the new one lands in a different cell, and a later blind save to slot 0 would write the wrong session's bytes to the new entry's file. So before forwarding a new conversation, the proxy erases slot 0 (the previous conversation is already saved to disk, so nothing is lost) to guarantee the engine publishes the new one into slot 0.
+
+The erase uses the tracked `active_digest` as an atomic precondition (`if_digest`), so it only succeeds if the slot actually holds the session the proxy believes. Defensive handling of mismatches:
+
+- **2xx:** slot vacated. `active_digest` cleared.
+- **400 (no retained session):** slot already vacant; nothing to do.
+- **409 mismatch:** the occupant is not the session we believe (e.g., the digest went stale). Erase unconditionally (second call without `if_digest`); if that also fails, continue best-effort.
+- **409 busy:** an active request holds the slot. In the single-concurrency proxy this should not happen; log and continue best-effort.
+- **Timeout / connection error:** log and continue best-effort (or treat as upstream down, per 9.3).
+
+When the erase does not actually vacate the slot (timeout, busy, second-erase failure), the proxy records `last_erase_ok = false` (for observability) and continues best-effort. The save step then proceeds unconditionally; in the rare case where the new conversation landed in a non-zero cell, the save would write the wrong session's bytes to this entry's file. The proxy cannot reliably detect this case, so it is a known limitation. In practice the erase almost always succeeds, so this edge case is rare.
 
 Restore procedure: call the restore endpoint (12.2) with `filename` set to the file name of the ledger entry's `bin_path`, bounded by `save_timeout`. The proxy cannot inspect the bin; it judges by the HTTP result:
 
@@ -316,9 +330,9 @@ On a connection error: return `502` for the client request and reset active chat
 
 | Action | Request | Success response |
 | --- | --- | --- |
-| save | `POST /slots/0?action=save&model=<m>` body `{"model": "<m>", "filename": "<entry id>.bin"}` | `{"id_slot": 0, "filename": ..., "n_saved": ..., "n_written": ..., "timings": {"save_ms": ...}}` |
-| restore | `POST /slots/0?action=restore&model=<m>` body `{"model": "<m>", "filename": "<entry id>.bin"}` | `{"id_slot": 0, "filename": ..., "n_restored": ..., "n_read": ..., "timings": {"restore_ms": ...}}` |
-| erase (not used by this spec) | `POST /slots/0?action=erase&model=<m>` | `{"id_slot": 0, "n_erased": ...}` |
+| save | `POST /slots/0?action=save&model=<m>` body `{"model": "<m>", "filename": "<entry id>.bin"}` | `{"id_slot": 0, "filename": ..., "n_saved": ..., "n_written": ..., "session_digest": ..., "timings": {"save_ms": ...}}` |
+| restore | `POST /slots/0?action=restore&model=<m>` body `{"model": "<m>", "filename": "<entry id>.bin"}` | `{"id_slot": 0, "filename": ..., "n_restored": ..., "n_read": ..., "session_digest": ..., "timings": {"restore_ms": ...}}` |
+| erase | `POST /slots/0?action=erase&model=<m>[&if_digest=<d>]` body `{"model": "<m>"}` | `{"id_slot": 0, "n_erased": ...}` |
 
 Notes:
 
@@ -328,6 +342,8 @@ Notes:
 4. Without `--slot-save-path` the server returns `501` (`This server does not support slots action. Start it with --slot-save-path`).
 5. API shape in current mainline is `POST /slots/{id}` with `?action=`. The old `/slots/0/save` and `/slots/0/load` paths no longer exist.
 6. The save file contains the llama state (KV sequence), context checkpoints and draft-model state; restore restores all of them.
+7. **`session_digest`:** save and restore return a `session_digest` (a hash of the session's state). The proxy records it as `active_digest` and uses it as the `if_digest` precondition on the next erase, so the erase only succeeds if the slot still holds the same session. This makes the vacate step (6.1.1) atomic and prevents erasing the wrong session.
+8. **Erase semantics:** `400` means the slot holds no retained session (already vacant); `409` means either `slot_busy` (an active request holds the slot) or `slot_session_mismatch` (the `if_digest` precondition failed). The proxy handles all three (see 6.1.1).
 
 ### 12.3 Other endpoints the proxy relies on
 
@@ -335,3 +351,4 @@ Notes:
 2. `POST /v1/chat/completions`: OAI-compatible; streaming is SSE; the response includes a `timings` object and a standard `usage` object. SSE must be passed through byte-transparently.
 3. `GET /health` returns `200` or `503` (loading). `GET /health`, `/props`, `/models` and `/metrics` do not count as tasks and do not wake a sleeping model.
 4. `--sleep-idle-seconds`: after inactivity the model and KV cache are unloaded from RAM. This is the constraint in 1.2.5.
+5. `GET /slots`: returns the per-cell state of the private continuation catalog. Each cell has `id`, `is_processing`, `retained` (whether a session is retained in the cell), `session_digest`, and timing counters. The proxy does not currently use this endpoint (it is exposed by the upstream client for future observability and potential slot-tracking improvements). In llama.cpp this endpoint has a different shape (or does not exist).

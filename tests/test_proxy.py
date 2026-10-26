@@ -273,7 +273,8 @@ async def test_save_runs_after_the_chat_and_before_the_next_queued_request(proxy
     s = fake.summary()
     first_chat = s.index("chat:27B")
     assert s[first_chat + 1].startswith("slot:save")          # save sits between the two chats
-    assert s[first_chat + 2] == "chat:27B"
+    assert s[first_chat + 2].startswith("slot:erase")        # erase vacates the slot for the new conversation
+    assert s[first_chat + 3] == "chat:27B"
 
 
 async def test_noop_and_failed_responses_never_save(proxy, fake):

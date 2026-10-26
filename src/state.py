@@ -6,8 +6,10 @@ class State:
         self.active_model = ""
         self.active_chat = ""        # entry id believed to be in the slot, "" = none/noop
         self.active_chat_id = ""     # chat id of active_chat (needed to create a ledger entry)
+        self.active_digest = ""      # session_digest of the active conversation (from last save/restore)
         self.loaded_chats = set()    # entry ids seen or restored since start/reset
         self.tracked_paths = {}      # model id -> slot-save-path (None = unknown)
+        self.last_erase_ok = True    # was the most recent pre-chat erase successful? (observability)
 
     def set_active(self, classified):
         if classified.model_id:
@@ -20,4 +22,6 @@ class State:
         self.active_model = ""
         self.active_chat = ""
         self.active_chat_id = ""
+        self.active_digest = ""
         self.loaded_chats = set()
+        self.last_erase_ok = True

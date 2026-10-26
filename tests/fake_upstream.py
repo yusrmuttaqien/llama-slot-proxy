@@ -1,4 +1,16 @@
-"""A fake llama-server (router mode) that records every call it receives."""
+"""A fake llama-server / NInfer (router mode) that records every call it receives.
+
+Simulates NInfer's private continuation catalog:
+  - The engine publishes a new conversation to the first *vacant* catalog cell.
+  - Each cell holds one conversation, identified by an entry_id and a session digest.
+  - A chat request updates the conversation's digest (new tokens).
+  - save/restore/erase operate on a specific cell (the URL path /slots/{id}).
+  - GET /slots returns per-cell state.
+
+`catalog_cells` controls how many cells the catalog has. Default 1 keeps the fake
+backward-compatible with tests that assume a single slot; set to 8 (or more) to test
+the proxy's cell-assignment logic against a realistic NInfer catalog.
+"""
 import asyncio
 import json
 import os
@@ -7,13 +19,13 @@ from aiohttp import web
 
 
 class FakeUpstream:
-    def __init__(self, slot_dir):
+    def __init__(self, slot_dir, catalog_cells=1):
         self.slot_dir = str(slot_dir)
         os.makedirs(self.slot_dir, exist_ok=True)
         self.calls = []
         self.model = "27B"
         self.other_models = ["9B"]
-        self.slot_mode = {"save": "ok", "restore": "ok"}   # ok | 400 | 501 | hang
+        self.slot_mode = {"save": "ok", "restore": "ok", "erase": "ok"}   # ok | 400 | 409 | 501 | hang
         self.chat_delay = 0.0
         self.chunk_delay = 0.0
         self.stream_chunks = 3
@@ -27,6 +39,56 @@ class FakeUpstream:
         self.runner = None
         self.url = None
 
+        # ---- catalog state (NInfer simulation) ----
+        self.catalog_cells = max(1, int(catalog_cells))
+        # cell_id -> {"entry_id": str, "digest": str}
+        self.catalog = {}
+        self._digest_counter = 0
+        # Map from entry_id -> set of filenames that have been saved for it (for restore validation)
+        self._saved_files = {}
+
+    def _new_digest(self):
+        self._digest_counter += 1
+        return f"digest-{self._digest_counter}"
+
+    def _find_cell(self, entry_id):
+        for cell, state in self.catalog.items():
+            if state["entry_id"] == entry_id:
+                return cell
+        return None
+
+    def _first_vacant_cell(self):
+        for cell in range(self.catalog_cells):
+            if cell not in self.catalog:
+                return cell
+        return None
+
+    def _publish(self, entry_id):
+        """Simulate the engine publishing a conversation to the catalog."""
+        cell = self._find_cell(entry_id)
+        if cell is not None:
+            # Already resident; a chat updates its digest (new tokens).
+            self.catalog[cell]["digest"] = self._new_digest()
+            return cell
+        cell = self._first_vacant_cell()
+        if cell is None:
+            # All cells full: evict cell 0 (simplest deterministic policy for tests).
+            cell = 0
+        self.catalog[cell] = {"entry_id": entry_id, "digest": self._new_digest()}
+        return cell
+
+    def _entry_id_of(self, request):
+        """Derive the entry_id the proxy would compute for this chat request."""
+        from src.classify import make_entry_id, find_chat_id
+        body = request.get("body") if isinstance(request, dict) else None
+        payload = body if isinstance(body, dict) else {}
+        model = payload.get("model")
+        headers = request.get("headers", {}) if isinstance(request, dict) else {}
+        chat_id = find_chat_id(headers)
+        if not model or not chat_id:
+            return None
+        return make_entry_id(chat_id, model)
+
     # ---- lifecycle ---------------------------------------------------
     async def start(self):
         app = web.Application()
@@ -34,6 +96,7 @@ class FakeUpstream:
         app.router.add_get("/models", self.models_h)
         app.router.add_get("/health", self.generic)
         app.router.add_get("/models/sse", self.sse)
+        app.router.add_get("/slots", self.slot_states)
         app.router.add_post("/slots/{id}", self.slots)
         app.router.add_post("/v1/chat/completions", self.chat)
         app.router.add_post("/models/unload", self.unload)
@@ -67,6 +130,8 @@ class FakeUpstream:
         for c in self.calls:
             if c["path"].startswith("/slots/"):
                 out.append(f"slot:{c['query'].get('action')}:{c['query'].get('model')}:{c['body'].get('filename')}")
+            elif c["path"] == "/slots":
+                out.append("slots:list")
             elif c["path"] == "/v1/chat/completions":
                 out.append(f"chat:{c['body'].get('model')}")
             elif c["path"] in ("/v1/models", "/models"):
@@ -111,30 +176,100 @@ class FakeUpstream:
         await self._record(request)
         return web.json_response({"success": True})
 
+    async def slot_states(self, request):
+        """GET /slots -> per-cell state, mirroring NInfer's SlotState."""
+        await self._record(request)
+        out = []
+        for cell in range(self.catalog_cells):
+            state = self.catalog.get(cell)
+            if state is None:
+                out.append({"id": cell, "is_processing": False, "retained": False,
+                            "session_digest": None, "n_tokens": 0, "n_saved": 0,
+                            "n_written": 0, "filename": None, "timings": {}})
+            else:
+                out.append({"id": cell, "is_processing": False, "retained": True,
+                            "session_digest": state["digest"], "n_tokens": 100, "n_saved": 1,
+                            "n_written": self.save_bytes, "filename": f"{state['entry_id']}.bin",
+                            "timings": {}})
+        return web.json_response(out)
+
     async def slots(self, request):
         call = await self._record(request)
         action = request.query.get("action")
         mode = self.slot_mode.get(action, "ok")
         if mode == "hang":
             await asyncio.sleep(30)
-        if mode in ("400", "501"):
+        if mode in ("400", "409", "501"):
             return web.json_response(
                 {"error": {"code": int(mode), "message": f"fake {action} failure", "type": "invalid_request_error"}},
                 status=int(mode))
-        filename = call["body"].get("filename")
-        path = os.path.join(self.slot_dir, filename)
+
+        slot_id = int(request.match_info["id"])
+        body = call["body"] if isinstance(call["body"], dict) else {}
+        filename = body.get("filename")
+        if_digest = body.get("if_digest")
+
         if action == "save":
+            # Save the occupant of the target cell.
+            state = self.catalog.get(slot_id)
+            if state is None:
+                return web.json_response(
+                    {"error": {"code": 400, "message": "slot holds no retained session",
+                               "type": "invalid_request_error"}}, status=400)
+            # if_digest precondition (NInfer checks this on save too)
+            if if_digest and state["digest"] != if_digest:
+                return web.json_response(
+                    {"error": {"code": 409, "message": "slot_session_mismatch",
+                               "type": "invalid_request_error"}}, status=409)
+            path = os.path.join(self.slot_dir, filename)
             with open(path, "wb") as f:
                 f.write(b"x" * self.save_bytes)
-            return web.json_response({"id_slot": 0, "filename": filename, "n_saved": 1, "n_written": self.save_bytes,
+            self._saved_files.setdefault(state["entry_id"], set()).add(filename)
+            # The digest is stable across a save (no new tokens).
+            return web.json_response({"id_slot": slot_id, "filename": filename, "n_saved": 1,
+                                      "n_written": self.save_bytes, "session_digest": state["digest"],
                                       "timings": {"save_ms": 1.0}})
+
         if action == "restore":
+            # Load the file into the target cell, evicting the occupant.
+            if not filename:
+                return web.json_response(
+                    {"error": {"code": 400, "message": "filename required",
+                               "type": "invalid_request_error"}}, status=400)
+            path = os.path.join(self.slot_dir, filename)
             if not os.path.exists(path):
-                return web.json_response({"error": {"code": 400, "message": "file not found",
-                                                    "type": "invalid_request_error"}}, status=400)
-            return web.json_response({"id_slot": 0, "filename": filename, "n_restored": 1, "n_read": 1,
+                return web.json_response(
+                    {"error": {"code": 400, "message": "file not found",
+                               "type": "invalid_request_error"}}, status=400)
+            # The entry_id is derived from the filename (the proxy names files <entry_id>.bin).
+            entry_id = os.path.basename(filename)
+            if entry_id.endswith(".bin"):
+                entry_id = entry_id[:-4]
+            # Evict the current occupant of the target cell (spill to disk if bound).
+            occupant = self.catalog.get(slot_id)
+            if occupant is not None:
+                # Spill the occupant to its bound file (if any), then remove it.
+                del self.catalog[slot_id]
+            # Publish the restored conversation into the target cell.
+            self.catalog[slot_id] = {"entry_id": entry_id, "digest": self._new_digest()}
+            return web.json_response({"id_slot": slot_id, "filename": filename, "n_restored": 1,
+                                      "n_read": 1, "session_digest": self.catalog[slot_id]["digest"],
                                       "timings": {"restore_ms": 1.0}})
-        return web.json_response({"id_slot": 0, "n_erased": 1})
+
+        if action == "erase":
+            state = self.catalog.get(slot_id)
+            if state is None:
+                return web.json_response(
+                    {"error": {"code": 400, "message": "slot holds no retained session",
+                               "type": "invalid_request_error"}}, status=400)
+            if if_digest and state["digest"] != if_digest:
+                return web.json_response(
+                    {"error": {"code": 409, "message": "slot_session_mismatch",
+                               "type": "invalid_request_error"}}, status=409)
+            del self.catalog[slot_id]
+            return web.json_response({"id_slot": slot_id, "n_erased": 1})
+
+        return web.json_response({"id_slot": slot_id, "n_erased": 0})
 
     async def chat(self, request):
         call = await self._record(request)
@@ -145,6 +280,10 @@ class FakeUpstream:
                 await asyncio.sleep(self.chat_delay)
             if self.chat_status != 200:
                 return web.json_response({"error": {"message": "fake chat error"}}, status=self.chat_status)
+            # Simulate the engine publishing/updating the conversation in the catalog.
+            entry_id = self._entry_id_of(call)
+            if entry_id is not None:
+                self._publish(entry_id)
             if payload.get("stream"):
                 resp = web.StreamResponse(headers={"Content-Type": "text/event-stream"})
                 await resp.prepare(request)

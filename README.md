@@ -15,6 +15,7 @@ Everything below is a constraint you must accept to use the proxy. The proxy onl
 - Single slot: `--parallel 1` (or `-np 1`) — the proxy hard-codes slot `0`
 - `--slot-save-path` set and readable/writable by the proxy host; the proxy and llama-server share that filesystem
 - If the upstream does not expose `--slot-save-path` in `/v1/models` `status.args` (e.g. NInfer), set `slot_save_path` in `config.json` instead — the directory the upstream writes slot saves into, still shared with the proxy host
+- **NInfer:** the engine assigns each conversation to the first *vacant* catalog cell (not always cell 0). The proxy handles this by erasing slot 0 before publishing a new conversation (6.1.1), so the new one lands in cell 0 and the proxy's fixed slot-0 addressing stays correct. Requires `--host-state-slots` ≥ 1 (the catalog size).
 - `--sleep-idle-seconds` unset or 0 — sleep discards the KV cache behind the proxy's back
 
 **How the proxy works (by design):**
@@ -23,6 +24,7 @@ Everything below is a constraint you must accept to use the proxy. The proxy onl
 - Single-flight FIFO queue: only one request reaches llama-server at a time, so concurrent work serializes (cheap GETs are exempt)
 - Saves are lazy: a chat is persisted only on the time/delta/model-change/unload/shutdown triggers, not immediately
 - Dumb restore, no validation: if a bin no longer matches the request it degrades, and the next save re-syncs it
+- **New conversations vacate slot 0:** before forwarding a brand-new chat, the proxy erases the previous occupant of slot 0 (using the tracked `session_digest` as an atomic `if_digest` precondition) so the engine publishes the new conversation into slot 0. The previous conversation is already saved to disk, so nothing is lost. If the erase fails (timeout, busy), the proxy continues best-effort; in the rare case the new conversation lands in a non-zero cell, the save may write the wrong session's bytes (a known limitation, but the erase almost always succeeds).
 - A→B→A within one run relies on llama-server's RAM cache (`--cache-ram`), not on the proxy
 - Unsaved progress is lost if another chat takes the slot and the first never returns
 - Non-chat slot endpoints (`/v1/completions`, `/infill`, ...) can silently replace slot contents

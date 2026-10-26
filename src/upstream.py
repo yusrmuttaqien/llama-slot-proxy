@@ -29,6 +29,15 @@ class SlotResult:
     def ok(self):
         return self.kind is SlotKind.OK
 
+    @property
+    def digest(self):
+        """session_digest from an OK save/restore response, or '' if absent."""
+        if self.ok and isinstance(self.data, dict):
+            d = self.data.get("session_digest")
+            if isinstance(d, str):
+                return d
+        return ""
+
 
 class UpstreamClient:
     def __init__(self, base_url, save_timeout):
@@ -59,10 +68,14 @@ class UpstreamClient:
                 raise RuntimeError(f"GET {path_qs} returned HTTP {r.status}")
             return json.loads(body)
 
-    async def _slot_action(self, action, model, filename):
+    async def _slot_action(self, action, model, filename=None, if_digest=None):
         query = urlencode({"action": action, "model": model})
         url = self.url(f"/slots/{SLOT_ID}?{query}")
-        payload = {"model": model, "filename": filename}
+        payload = {"model": model}
+        if filename is not None:
+            payload["filename"] = filename
+        if if_digest:
+            payload["if_digest"] = if_digest
         timeout = aiohttp.ClientTimeout(total=self.save_timeout or None)
         try:
             async with self.session.post(url, json=payload, timeout=timeout) as r:
@@ -79,11 +92,22 @@ class UpstreamClient:
         except aiohttp.ClientError as e:
             return SlotResult(SlotKind.CONN_ERROR, message=str(e))
 
-    async def slot_save(self, model, filename):
-        return await self._slot_action("save", model, filename)
+    async def slot_save(self, model, filename, if_digest=None):
+        return await self._slot_action("save", model, filename, if_digest)
 
     async def slot_restore(self, model, filename):
         return await self._slot_action("restore", model, filename)
+
+    async def slot_erase(self, model, if_digest=None):
+        return await self._slot_action("erase", model, None, if_digest)
+
+    async def slot_states(self):
+        """GET /slots -> list of per-cell states (id, is_processing, retained, session_digest, ...).
+        Raises RuntimeError on failure (caller decides how to degrade)."""
+        data = await self.get_json("/slots")
+        if not isinstance(data, list):
+            raise RuntimeError(f"GET /slots returned non-list: {type(data).__name__}")
+        return data
 
 
 def _error_message(raw):
