@@ -137,14 +137,19 @@ For a tracked request:
 
 1. Entry id **is** the active chat (a **continuation** — same conversation as the previous request): forward with no restore. The conversation is already in the active slot, so restoring would be a pointless disk round-trip.
 2. Entry id is **not** in the ledger (a **new unique request**): add it to loaded chats. If a previous conversation occupies the slot, **erase** it first (6.1.1) so the engine publishes the new conversation into slot 0; then forward with no restore (plain prefill). For the very first request (no active chat) the slot is already vacant, so no erase is needed.
-3. Otherwise (entry id is in the ledger, and it is a *different* conversation than the active chat): restore the slot, then forward. This happens even if the conversation was seen before, because the upstream engine may have evicted it in the meantime and the on-disk snapshot is then the only remaining copy.
+3. Otherwise (entry id is in the ledger, and it is a *different* conversation than the active chat): **vacate** the current occupant of slot 0 (6.1.1) so its KV pages are free for the snapshot, then restore the slot and forward. This happens even if the conversation was seen before, because the upstream engine may have evicted it in the meantime and the on-disk snapshot is then the only remaining copy. NInfer refuses a restore whose snapshot does not fit in the free KV pool, and it will not evict the current occupant for us, so the vacate is required.
 4. Noop request: forward with no restore.
 
 > **Note (NInfer / dynamic retention).** The original rule ("skip restore if the entry is in loaded chats") assumed the proxy controls slot residency, as in llama.cpp. In NInfer the *engine* decides what stays resident (active slot + a fixed pool of host state slots), so a proxy-side "seen" set cannot be trusted to mean "still in the slot". The rule above therefore restores on every switch to a different saved conversation. A redundant restore (switching back to a conversation that is still resident) costs only a small disk read plus a device round-trip, which is far cheaper than the full prefill that a missed restore would trigger.
 
-#### 6.1.1 Vacating the slot for a new conversation
+#### 6.1.1 Vacating the slot before a slot change
 
-NInfer's `/slots/{id}` addresses the private continuation-catalog cells, not a fixed active lane. A *new* conversation is published by the engine to the first *vacant* catalog cell. If slot 0 still holds the previous conversation, the new one lands in a different cell, and a later blind save to slot 0 would write the wrong session's bytes to the new entry's file. So before forwarding a new conversation, the proxy erases slot 0 (the previous conversation is already saved to disk, so nothing is lost) to guarantee the engine publishes the new one into slot 0.
+NInfer's `/slots/{id}` addresses the private continuation-catalog cells, not a fixed active lane. Two operations require the current occupant of slot 0 to be cleared first:
+
+1. A *new* conversation (no saved state) is published by the engine to the first *vacant* catalog cell. If slot 0 still holds the previous conversation, the new one lands in a different cell, and a later blind save to slot 0 would write the wrong session's bytes to the new entry's file.
+2. A *restore* of a different conversation must fit in the *free* KV pages. NInfer refuses to restore a snapshot whose KV pages exceed the free pool ("session snapshot does not fit the free KV capacity; evict other sessions first"). It will not evict the current occupant for you, so the proxy must do it.
+
+In both cases the current occupant is already saved to disk (the proxy saves after every request), so erasing it loses nothing; it is restored from disk later if the user switches back to it.
 
 The erase uses the tracked `active_digest` as an atomic precondition (`if_digest`), so it only succeeds if the slot actually holds the session the proxy believes. Defensive handling of mismatches:
 
@@ -159,7 +164,10 @@ When the erase does not actually vacate the slot (timeout, busy, second-erase fa
 Restore procedure: call the restore endpoint (12.2) with `filename` set to the file name of the ledger entry's `bin_path`, bounded by `save_timeout`. The proxy cannot inspect the bin; it judges by the HTTP result:
 
 1. **2xx:** set the ledger `restored` date and add the entry id to loaded chats. **\[new\]**
-2. **HTTP error (the server returns 400 when the file is missing or invalid, the tokens do not fit the slot context, or the tokens are invalid):** the bin is considered unusable. Delete the entry and its bin, add the entry id to loaded chats so the same request is not retried, log the error, and forward the client request as plain prefill. This is not returned to the client as an error. **\[new\]**
+2. **HTTP error:** the server rejected the restore. Distinguish a capacity problem from a bad/missing file:
+   - **Capacity refusal** (the message contains "does not fit" or "evict other sessions"): the snapshot is valid but did not fit the free pool this time (e.g., the vacate failed, or other sessions hold too many pages). **Keep** the entry (do not delete it) so the state can be retried later, add the entry id to loaded chats, log the error, and forward the client request as plain prefill.
+   - **Missing/invalid file:** the bin is unusable. Delete the entry and its bin, add the entry id to loaded chats so the same request is not retried, log the error, and forward the client request as plain prefill.
+   In neither case is the error returned to the client. **\[new\]**
 3. **Timeout (`save_timeout`):** log it, keep the entry, add it to loaded chats, and continue the queue (see 9.2).
 4. **Connection error:** treated as upstream down (9.3).
 
@@ -337,7 +345,7 @@ On a connection error: return `502` for the client request and reset active chat
 Notes:
 
 1. `filename` is required in the body and validated as a plain filename (no path traversal). The file is written under the server's `--slot-save-path` for that model, which is why bins are named `<entry id>.bin` and the proxy needs only the directory.
-2. Restore errors are `400`: file missing or invalid, tokens do not fit in the slot context, invalid tokens.
+2. Restore errors are `400`: file missing or invalid, tokens do not fit in the slot context, invalid tokens, or the snapshot does not fit in the free KV capacity ("session snapshot does not fit the free KV capacity; evict other sessions first"). The proxy distinguishes the capacity case (keep the entry, retry later) from a bad/missing file (drop the entry) — see 6.1.
 3. If the slot is busy, the server defers the save/restore task until the slot is idle and holds the HTTP request open. The proxy does not need to poll `is_processing`; `save_timeout` bounds the wait.
 4. Without `--slot-save-path` the server returns `501` (`This server does not support slots action. Start it with --slot-save-path`).
 5. API shape in current mainline is `POST /slots/{id}` with `?action=`. The old `/slots/0/save` and `/slots/0/load` paths no longer exist.
