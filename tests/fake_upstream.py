@@ -231,7 +231,17 @@ class FakeUpstream:
                                       "timings": {"save_ms": 1.0}})
 
         if action == "restore":
-            # Load the file into the target cell, evicting the occupant.
+            # Load the file into the target cell. NInfer refuses a restore whose
+            # snapshot does not fit in the *free* KV capacity, and it will NOT evict
+            # the current occupant for you ("evict other sessions first"). We simulate
+            # this faithfully:
+            #   - If the target cell is occupied by a *different* conversation, the
+            #     occupant's pages are not free, so the snapshot does not fit and the
+            #     restore is refused.
+            #   - If the target cell is occupied by the *same* conversation (e.g. after a
+            #     proxy restart, where the engine persisted the session), the restore is a
+            #     no-op: the snapshot matches the resident state, so it succeeds without
+            #     evicting anything.
             if not filename:
                 return web.json_response(
                     {"error": {"code": 400, "message": "filename required",
@@ -245,11 +255,18 @@ class FakeUpstream:
             entry_id = os.path.basename(filename)
             if entry_id.endswith(".bin"):
                 entry_id = entry_id[:-4]
-            # Evict the current occupant of the target cell (spill to disk if bound).
             occupant = self.catalog.get(slot_id)
             if occupant is not None:
-                # Spill the occupant to its bound file (if any), then remove it.
-                del self.catalog[slot_id]
+                if occupant["entry_id"] == entry_id:
+                    # Same conversation already resident: no-op restore (snapshot matches).
+                    return web.json_response({"id_slot": slot_id, "filename": filename, "n_restored": 1,
+                                              "n_read": 0, "session_digest": occupant["digest"],
+                                              "timings": {"restore_ms": 0.5}})
+                # Different conversation occupies the cell: capacity refusal.
+                return web.json_response(
+                    {"error": {"code": 400,
+                               "message": "session snapshot does not fit the free KV capacity; evict other sessions first",
+                               "type": "invalid_request_error"}}, status=400)
             # Publish the restored conversation into the target cell.
             self.catalog[slot_id] = {"entry_id": entry_id, "digest": self._new_digest()}
             return web.json_response({"id_slot": slot_id, "filename": filename, "n_restored": 1,

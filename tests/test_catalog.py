@@ -131,3 +131,31 @@ async def test_get_slots_returns_per_cell_state(proxy8, fake8):
     cell1 = next(s for s in states if s["id"] == 1)
     assert cell1["retained"] is False
     assert cell1["session_digest"] is None
+
+
+async def test_capacity_error_on_restore_keeps_ledger_entry(proxy8, fake8):
+    """If the vacate fails (so the restore still hits a capacity refusal), the proxy
+    must keep the ledger entry (the snapshot is valid, just didn't fit this time) rather
+    than deleting it. The distinguishing signal: a kept entry retains its original
+    'created' date, whereas a dropped-and-recreated entry gets a fresh one. The current
+    request falls back to a prefill; the saved state is preserved for a later retry."""
+    await proxy8.chat(chat_id="A")
+    await proxy8.chat(chat_id="B")
+    # A is evicted; B is in cell 0. A's snapshot is on disk.
+    assert fake8.catalog.get(0, {}).get("entry_id") == eid("B")
+    entry_a = proxy8.ctx.ledger.get(eid("A"))
+    assert entry_a is not None
+    original_created = entry_a["dates"]["created"]
+
+    # Make the erase fail, so the proxy cannot vacate B before restoring A.
+    fake8.slot_mode["erase"] = "400"
+    await proxy8.chat(chat_id="A")
+    fake8.slot_mode["erase"] = "ok"
+
+    # The restore hit a capacity refusal (cell 0 still holds B). The proxy must keep
+    # A's ledger entry (not delete it), so the original 'created' date survives.
+    entry_a_after = proxy8.ctx.ledger.get(eid("A"))
+    assert entry_a_after is not None, "capacity error must keep the entry"
+    assert entry_a_after["dates"]["created"] == original_created, "kept entry retains its created date"
+    # The chat was still served (prefill fallback).
+    assert any(s.startswith("chat:27B") for s in fake8.summary())

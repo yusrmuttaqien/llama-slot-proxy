@@ -1,12 +1,21 @@
-"""Lazy restore (spec 6.1) plus slot-vacating for new conversations.
+"""Lazy restore (spec 6.1) plus slot-vacating before any slot change.
 
 NInfer's /slots/{id} addresses the private continuation-catalog cells, not a fixed
-active lane. A *new* conversation (no saved state) is published by the engine to the
-first *vacant* catalog cell. If slot 0 still holds the previous conversation, the new
-one lands in a different cell, and a later blind save to slot 0 would write the wrong
-session's bytes to the new entry's file. So before forwarding a new conversation we
-erase slot 0 (the previous conversation is already saved to disk, so nothing is lost)
-to guarantee the engine publishes the new one into slot 0.
+active lane. Two things require the current occupant of slot 0 to be cleared first:
+
+1. A *new* conversation (no saved state) is published by the engine to the first
+   *vacant* catalog cell. If slot 0 still holds the previous conversation, the new one
+   lands in a different cell, and a later blind save to slot 0 would write the wrong
+   session's bytes to the new entry's file.
+
+2. A *restore* of a different conversation must fit in the *free* KV pages. NInfer
+   refuses to restore a snapshot whose KV pages exceed the free pool ("session snapshot
+   does not fit the free KV capacity; evict other sessions first"). It will not evict
+   the current occupant for you, so the proxy must do it.
+
+In both cases the current occupant is already saved to disk (the proxy saves after every
+request), so erasing it loses nothing; it is restored from disk later if the user
+switches back to it.
 """
 import os
 from enum import Enum
@@ -27,7 +36,9 @@ async def maybe_restore(ctx, c):
       active slot, so it is neither restored nor erased.
     - A switch to a different conversation that has a saved state is always restored,
       even if that conversation was seen before: the upstream engine may have evicted it
-      in the meantime, and the on-disk snapshot is then the only remaining copy.
+      in the meantime, and the on-disk snapshot is then the only remaining copy. Before
+      restoring, the current occupant of slot 0 is erased so its KV pages are free for
+      the snapshot (NInfer refuses a restore that does not fit the free pool).
     - A brand-new conversation (no saved state) cannot be restored. We instead erase the
       current occupant of slot 0 so the engine publishes the new conversation into slot 0
       (the first vacant cell), keeping the proxy's fixed slot-0 addressing correct.
@@ -45,6 +56,13 @@ async def maybe_restore(ctx, c):
                 return Outcome.UPSTREAM_DOWN
         return Outcome.CONTINUE
 
+    # Vacate the current occupant of slot 0 so its KV pages are free for the snapshot.
+    # NInfer refuses a restore whose KV pages exceed the free pool, and it will not
+    # evict the occupant for us. The occupant is already saved to disk, so nothing is
+    # lost; it is restored from disk later if the user switches back to it.
+    if st.active_chat and st.active_chat != c.entry_id:
+        if not await _vacate_slot(ctx, log):
+            return Outcome.UPSTREAM_DOWN
     filename = os.path.basename(entry["bin_path"])
     log.info(f"restore: entry {c.entry_id} from {filename}")
     res = await ctx.upstream.slot_restore(c.model_id, filename)
@@ -62,7 +80,16 @@ async def maybe_restore(ctx, c):
         log.error(f"restore of entry {c.entry_id} timed out ({res.message}); continuing with prefill")
         st.loaded_chats.add(c.entry_id)
         return Outcome.CONTINUE
-    # HTTP error: the server rejected this bin (missing/invalid/does not fit)
+    # HTTP error: the server rejected the restore. Distinguish a capacity problem
+    # (snapshot is valid but did not fit the free pool this time) from a bad/missing
+    # file. On a capacity problem we keep the entry so it can be retried later and
+    # continue with a prefill for now; on a bad/missing file we drop the entry.
+    msg = (res.message or "").lower()
+    if "does not fit" in msg or "evict other sessions" in msg:
+        log.error(f"restore of entry {c.entry_id} did not fit the free KV capacity "
+                  f"(HTTP {res.status}: {res.message}); keeping entry and continuing with prefill")
+        st.loaded_chats.add(c.entry_id)
+        return Outcome.CONTINUE
     log.error(f"restore of entry {c.entry_id} rejected (HTTP {res.status}: {res.message}); "
               "dropping entry and continuing with prefill")
     try:
