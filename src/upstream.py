@@ -68,9 +68,9 @@ class UpstreamClient:
                 raise RuntimeError(f"GET {path_qs} returned HTTP {r.status}")
             return json.loads(body)
 
-    async def _slot_action(self, action, model, filename=None, if_digest=None):
+    async def _slot_action(self, action, model, filename=None, if_digest=None, cell_id=SLOT_ID):
         query = urlencode({"action": action, "model": model})
-        url = self.url(f"/slots/{SLOT_ID}?{query}")
+        url = self.url(f"/slots/{cell_id}?{query}")
         payload = {"model": model}
         if filename is not None:
             payload["filename"] = filename
@@ -98,8 +98,8 @@ class UpstreamClient:
     async def slot_restore(self, model, filename):
         return await self._slot_action("restore", model, filename)
 
-    async def slot_erase(self, model, if_digest=None):
-        return await self._slot_action("erase", model, None, if_digest)
+    async def slot_erase(self, model, if_digest=None, cell_id=SLOT_ID):
+        return await self._slot_action("erase", model, None, if_digest, cell_id)
 
     async def slot_states(self):
         """GET /slots -> list of per-cell states (id, is_processing, retained, session_digest, ...).

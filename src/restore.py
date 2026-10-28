@@ -20,6 +20,8 @@ switches back to it.
 import os
 from enum import Enum
 
+import aiohttp
+
 from src.upstream import SlotKind
 
 
@@ -102,69 +104,78 @@ async def maybe_restore(ctx, c):
 
 
 async def _vacate_slot(ctx, log):
-    """Erase the current occupant of slot 0 so a new conversation is published there.
+    """Erase all occupied catalog cells so the KV pages of all resident sessions are
+    freed for the snapshot, so the snapshot fits in the free pool.
 
-    Uses the tracked active_digest as an atomic precondition (if_digest). Handles the
-    defensive edge cases where the occupant is not what we believe:
-      - 400 "no retained session"  -> slot already vacant, nothing to do.
-      - 409 mismatch               -> occupant changed; erase it unconditionally.
-      - 409 busy                   -> an active request holds the slot; best-effort continue.
-    Returns True when we can proceed (slot vacant or best-effort), False when the
-    upstream is unreachable. Sets st.last_erase_ok (for observability; the save step
-    currently proceeds best-effort regardless, since the proxy cannot reliably detect
-    which cell a new conversation landed in if the erase failed).
+    The capacity refusal is not (only) about the current occupant. It is about the
+    TOTAL KV pages in use across all sessions. With --host-state-slots 8, you have up
+    to 8 concurrent sessions, each holding its own KV pages in a catalog cell. When
+    you switch conversations, the snapshot must fit in the *free* KV pages. If the
+    snapshot is huge (~70% of the total context) and the other cells are still
+    occupied, the free pool is too small, and NInfer refuses the restore.
+
+    So before restoring, the proxy evicts ALL occupied cells (not just slot 0),
+    freeing the KV pages of every resident session. The snapshot then fits.
     """
     st = ctx.state
-    if_digest = st.active_digest or None
-    res = await ctx.upstream.slot_erase(st.active_model, if_digest=if_digest)
-    if res.ok:
-        st.active_digest = ""
-        st.last_erase_ok = True
-        log.info(f"erased previous occupant of slot 0 to make room for a new conversation")
-        return True
-    if res.kind is SlotKind.CONN_ERROR:
-        log.error(f"erase failed, upstream unreachable: {res.message}")
-        st.reset()
+    # Query GET /slots to discover which cells are occupied and their session digests.
+    # This is strictly better than the old tracked-digest approach: the proxy now
+    # always uses the *actual* digest from the live state, so there is no mismatch
+    # scenario (the digest is never stale relative to what we're about to erase).
+    # If the query fails (upstream unreachable), fall back to the tracked digest
+    # so the proxy can still make progress.
+    try:
+        states = await ctx.upstream.slot_states()
+    except (RuntimeError, aiohttp.ClientError) as e:
+        log.error(f"GET /slots failed ({e}); falling back to tracked digest")
+        # Fall back to the old behavior: erase slot 0 with the tracked digest.
+        res = await ctx.upstream.slot_erase(st.active_model, if_digest=(st.active_digest or None))
+        if res.ok:
+            st.active_digest = ""
+            st.last_erase_ok = True
+            return True
+        if res.kind is SlotKind.CONN_ERROR:
+            log.error(f"erase failed, upstream unreachable: {res.message}")
+            st.reset()
+            st.last_erase_ok = False
+            return False
         st.last_erase_ok = False
-        return False
-    if res.kind is SlotKind.TIMEOUT:
-        log.error(f"erase timed out ({res.message}); continuing best-effort")
-        st.last_erase_ok = False
         return True
-    # HTTP error path
-    if res.status == 400:
-        # Slot holds no retained session: already vacant. Nothing to do.
-        st.active_digest = ""
-        st.last_erase_ok = True
-        log.info("slot 0 already vacant; no erase needed")
-        return True
-    if res.status == 409:
-        # slot_busy or slot_session_mismatch.
-        if "mismatch" in (res.message or "").lower():
-            # The occupant is not the session we believe. Erase whatever it is.
-            log.info(f"slot 0 digest mismatch ({res.message}); erasing actual occupant")
-            res2 = await ctx.upstream.slot_erase(st.active_model)
-            if res2.ok:
-                st.active_digest = ""
-                st.last_erase_ok = True
-                return True
-            if res2.kind is SlotKind.CONN_ERROR:
-                log.error(f"second erase failed, upstream unreachable: {res2.message}")
+    # Identify all occupied cells (retained=True).
+    occupied = [s for s in states if s.get("retained")]
+    # Evict each occupied cell (call slot_erase on each, passing the session's
+    # digest as the if_digest precondition).
+    for s in occupied:
+        cell_id = s["id"]
+        digest = s.get("session_digest") or ""
+        res = await ctx.upstream.slot_erase(
+            st.active_model,
+            if_digest=digest,
+            cell_id=cell_id,
+        )
+        if res.ok:
+            log.info(f"erased cell {cell_id} (digest={digest})")
+            st.last_erase_ok = True
+        else:
+            # The erase was rejected. Handle the outcome.
+            if res.kind is SlotKind.CONN_ERROR:
+                log.error(f"erase of cell {cell_id} failed, upstream unreachable: {res.message}")
                 st.reset()
                 st.last_erase_ok = False
                 return False
-            log.error(f"second erase failed ({res2.status or ''} {res2.message}); continuing best-effort")
-            st.active_digest = ""
+            if res.kind is SlotKind.TIMEOUT:
+                log.error(f"erase of cell {cell_id} timed out ({res.message}); continuing best-effort")
+                st.last_erase_ok = False
+                return True
+            # HTTP error path
+            log.error(f"erase of cell {cell_id} rejected (HTTP {res.status}: {res.message}); continuing best-effort")
             st.last_erase_ok = False
             return True
-        # slot_busy: an active request holds the slot. In the single-concurrency proxy
-        # this should not happen; log and continue best-effort.
-        log.error(f"erase rejected (slot busy: {res.message}); continuing best-effort")
+    # If no occupied cells, the slot is already vacant.
+    if not occupied:
         st.active_digest = ""
-        st.last_erase_ok = False
+        st.last_erase_ok = True
         return True
-    # Any other HTTP error: log and continue best-effort.
-    log.error(f"erase rejected (HTTP {res.status}: {res.message}); continuing best-effort")
-    st.active_digest = ""
-    st.last_erase_ok = False
+    # If any occupied cell was erased, the slot is now vacant and the snapshot fits.
+    st.last_erase_ok = True
     return True
